@@ -1,0 +1,230 @@
+#!/usr/bin/env bash
+# License: BSD-0 Clause
+
+set -o errexit
+
+help() {
+	cat <<-'Instructions'
+		Pool Expander for TrueNAS(c) 13 - prototype
+
+		Performs installation and removal of the tn_pool_expander.js script
+
+		tn_pool_expander
+		  -i|--install   # Optional, install
+		  -r|--remove   # Optional, remove
+		  -h|--help     # Optional, show help
+
+		Examples of use:
+
+		  # Install pool expander
+		  tn_pool_expander --install
+
+		  # Remove pool expander
+		  tn_pool_expander --remove
+
+	Instructions
+	exit
+}
+
+
+
+StdErr() {
+	if [[ $1 == '0' ]]; then
+		[[ $2 ]] && printf "$2" "${@:3}" 1>&2
+	else
+		[[ $2 ]] && printf '%s'"$2" "ERROR: ${0##*/}, " "${@:3}" 1>&2
+		exit "$1"
+	fi
+}
+
+
+
+task=
+while [[ $1 ]]; do
+	case $1 in
+		'--install'|'-i')
+			task='install' ;;
+		'--remove'|'-r')
+			task='remove' ;;
+		'--help'|'-h')
+			help ;;
+		*)
+			help ;;
+	esac
+	shift
+done
+
+
+
+# Define adjustable env variables
+web_root='/usr/local/www/webui'
+script_filename='tn_pool_expander.js'
+
+
+
+# Define non-adjustable env variables
+index_html_path=$web_root'/index.html'
+script_filepath=$web_root'/'$script_filename
+script_tag='<script src="'"$script_filename"'"></script>'
+
+
+
+# Initial validation
+[[ $EUID == '0' ]] || StdErr 1 '%s\n' 'Must be run as root'
+[[ -d $web_root ]] || StdErr 1 '%s\n' 'Web directory missing: '"$web_root"
+[[ -f $index_html_path ]] || StdErr 1 '%s\n' 'index.html missing: '"$index_html_path"
+
+
+
+create_js_file(){
+
+# Write JavaScript contained in the heredoc to $script_filepath
+cat << 'JS_EOF' > "$script_filepath" || StdErr 1 '%s\n' 'Couldnt write script to: '"$script_filepath"
+
+/*
+Pool Expander for TrueNAS(c) Dashboard 0.0.1
+License: BSD-0 Clause, Ulfnic
+
+Summary: This script expands all children of all pools if the URL ends in: /ui/storage/pools
+
+Methodology: After the first chevron is created all chevrons will be expanded as they appear until
+X milliseconds after the last chevron has been expanded (time defined by poolPageExpansionMaxWaitForNext).
+
+Limitations: Pool Expander will re-expand elements closed by the user while the page is still loading
+and expansion is taking place. When elements are expanded or closed the HTML of the entire pool is
+reconstructed preventing Pool Expander from setting special attributes to know what it's already opened.
+
+Should this prove to be significant, this could be solved by recording each chevron's positional heirarchy in
+relationship to it's pool so it's skipped if seen again.
+*/
+
+(function(){
+	// Define env variables
+	let poolPageExpansionMaxWaitForNext = 1000
+	let poolPagePerformExpansion = false
+	let poolPageExpansionTimeout = null
+	let lastUrl = null
+
+	function checkUrl(){
+		// Read for URL change and flip poolPagePerformExpansion to true if it ends in /ui/storage/pools
+		// Note: Does not accommodate for querystrings and hashes should this prove to be an issue
+		if ( location.href !== lastUrl ) {
+			lastUrl = location.href;
+			if (lastUrl.endsWith('/ui/storage/pools')) {
+				poolPagePerformExpansion = true
+				clearTimeout(poolPageExpansionTimeout)
+			}
+			else {
+				poolPagePerformExpansion = false
+			}
+		}
+	}
+
+	// Listen for changes
+	new MutationObserver( (mutations) => {
+
+		checkUrl()
+
+		// If its the /ui/storage/pools page
+		if ( poolPagePerformExpansion == true ){
+
+			// Iterate through mutations
+			for ( let i = 0; i < mutations.length; i++ ){
+				for ( let i2 = 0; i2 < mutations[i].addedNodes.length; i2++){
+					let addedNode = mutations[i].addedNodes[i2]
+
+					// If the node is an element
+					if ( addedNode.nodeType === 1 ){
+
+						// If the node contains a chevron and that chevron is closed
+						if ( addedNode.tagName === 'P-TREETABLETOGGLER' && addedNode.getElementsByClassName('pi-chevron-right')[0] ){
+
+							// Clear the existing timeout for ending chevron expansion
+							clearTimeout(poolPageExpansionTimeout)
+							setTimeout(function(){
+
+								// Re-check if the chevron is closed and if so, click it
+								el=addedNode.getElementsByClassName('pi-chevron-right')[0]
+								if ( el !== undefined ){
+									el.click()
+								}
+
+								// Set a new timout for ending chevron expansion
+								poolPageExpansionTimeout = setTimeout(function(){
+									poolPagePerformExpansion = false
+								}, poolPageExpansionMaxWaitForNext)
+							}, 0)
+						}
+					}
+				}
+			}
+		}
+	}).observe(document.documentElement, {
+		childList: true,
+		subtree: true
+	});
+
+	checkUrl()
+})()
+
+JS_EOF
+
+}
+
+
+
+# Perform actions
+index_html=$(< "$index_html_path")
+case $task in
+	'install')
+
+		# Create pool_expander.js
+		if [[ -f "$script_filepath" ]]; then
+			StdErr 0 '%s\n' 'Overwriting existing script: '"$script_filepath"
+		else
+			StdErr 0 '%s\n' 'Installing script: '"$script_filepath"
+		fi
+		create_js_file
+
+		# Add the script tag to index.html just before </head>
+		if [[ $index_html == *"$script_tag"* ]]; then
+			StdErr 0 '%s\n' 'Script tag already installed: '"$index_html_path"
+		else
+			StdErr 0 '%s\n' 'Installing script tag: '"$index_html_path"
+
+			Re='(.*)</head>(.*)'
+			[[ $index_html =~ $Re ]] || StdErr 1 '%s\n' 'Cant find </head> in: '"$index_html_path"
+
+			printf '%s\n' "${BASH_REMATCH[1]}$script_tag"'</head>'"${BASH_REMATCH[2]}" > "$index_html_path"'_temp'
+			chgrp wheel "$index_html_path"'_temp'
+			mv "$index_html_path"'_temp' "$index_html_path"
+		fi
+		StdErr 0 '\n%s\n' 'Installation successful, you may need to clear your browser cache'
+		;;
+
+	'remove')
+
+		# Remove the script tag from index.html
+		if [[ $index_html == *"$script_tag"* ]]; then
+			StdErr 0 '%s\n' 'Removing script tag: '"$index_html_path"
+
+			printf '%s\n' "${index_html%"$script_tag"*}${index_html#*"$script_tag"}" > "$index_html_path"'_temp'
+			chgrp wheel "$index_html_path"'_temp'
+			mv "$index_html_path"'_temp' "$index_html_path"
+		else
+			StdErr 0 '%s\n' 'Script tag already removed: '"$index_html_path"
+		fi
+
+		# Remove pool_expander.js
+		if [[ -f "$script_filepath" ]]; then
+			StdErr 0 '%s\n' 'Removing: '"$script_filepath"
+			rm "$script_filepath"
+		else
+			StdErr 0 '%s\n' 'Script already removed: '"$script_filepath"
+		fi
+		StdErr 0 '\n%s\n' 'Removal successful, you may need to clear your browser cache'
+		;;
+esac
+
+
+
